@@ -187,281 +187,119 @@ class Cpu1802:
         raise AssertionError("firmware did not reach expected state")
 
 
+
 def firmware() -> bytes:
     return assemble(SOURCE.read_text(encoding="utf-8").splitlines())
 
 
-def cartridge_cpu(
-    segments: dict[int, Iterable[int]],
-    setup: Callable[[Cpu1802], None] | None = None,
-) -> Cpu1802:
-    image = bytearray(firmware())
-    for address, values in segments.items():
+def chip8_physical(address: int) -> int:
+    if 0x0200 <= address <= 0x06FF:
+        return address + 0x0100
+    if 0x0700 <= address <= 0x0AFF:
+        return address + 0x0500
+    raise AssertionError(f"CHIP-8 address outside initial program map: ${address:04X}")
+
+
+def chip8_cpu(segments: dict[int, Iterable[int]]) -> Cpu1802:
+    cpu = Cpu1802(firmware())
+    for logical, values in segments.items():
         payload = bytes(values)
-        assert 0x0400 <= address and address + len(payload) <= 0x0800
-        image[address:address + len(payload)] = payload
-    cpu = Cpu1802(bytes(image))
-    if setup is not None:
-        setup(cpu)
+        for offset, value in enumerate(payload):
+            cpu.memory[chip8_physical(logical + offset)] = value
     return cpu
 
 
-def run_cartridge(
-    segments: dict[int, Iterable[int]],
-    setup: Callable[[Cpu1802], None] | None = None,
-) -> Cpu1802:
-    cpu = cartridge_cpu(segments, setup)
-    cpu.run_until(lambda state: state.p == 3 and state.r[3] == 0x0700)
+def run_until(cpu: Cpu1802, predicate, limit: int = 20000) -> Cpu1802:
+    cpu.run_until(predicate, limit)
     return cpu
 
 
-def test_builtin_splash() -> None:
-    cpu = Cpu1802(firmware())
-    cpu.run_until(
-        lambda state: state.p == 3
-        and state.read(state.r[3]) == 0x30
-        and state.read(state.r[3] + 1) == (state.r[3] & 0xFF)
-    )
-    assert cpu.video_on
-    assert cpu.memory[0x08D2] == 0xF8
-    assert cpu.memory[0x08D4:0x08D6] == bytes([0x15, 0x11])
-    assert cpu.memory[0x08D8:0x08DE] == bytes([4, 4, 1, 2, 5, 5])
-    assert any(cpu.memory[0x0900:0x0A00])
-
-
-def test_display_enable_does_not_alias_dma_register() -> None:
-    symbols = define_symbols(SOURCE.read_text(encoding="utf-8").splitlines())
-    cpu = Cpu1802(firmware())
-    cpu.run_until(lambda state: state.video_on)
-    assert cpu.p == 4
-
-    # Model an immediately accepted eight-byte CDP1861 DMA burst. R0 may
-    # advance, but the firmware entry PC must remain independent of it.
-    cpu.r[0] = (cpu.r[0] + 8) & 0xFFFF
-    cpu.run_until(lambda state: state.p == 3 and state.r[3] == symbols["splash_idle"])
-
-
-def test_interrupt_vector_reenters_handler() -> None:
-    symbols = define_symbols(SOURCE.read_text(encoding="utf-8").splitlines())
+def test_firmware_stays_below_chip8_program_area() -> None:
     image = firmware()
-    assert symbols["irq_return"] + 1 == symbols["irq"]
-    assert image[symbols["irq_return"]] == 0x70
-
-    cpu = Cpu1802(image)
-    cpu.run_until(lambda state: state.p == 3 and state.r[3] == symbols["splash_idle"])
-
-    for _ in range(2):
-        saved_x, saved_p = cpu.x, cpu.p
-        cpu.ef[1] = 1
-        cpu.interrupt()
-        for _ in range(2000):
-            if cpu.p == 1 and cpu.r[1] == symbols["wait_display_end"]:
-                cpu.ef[1] = 0
-            cpu.step()
-            if cpu.ie and cpu.x == saved_x and cpu.p == saved_p:
-                break
-        else:
-            raise AssertionError("interrupt handler did not return")
-        assert cpu.r[1] == symbols["irq"]
+    assert image[0x0300:] == bytes([0xFF]) * (len(image) - 0x0300)
 
 
-def test_native_cartridge_entry() -> None:
-    image = bytearray(firmware())
-    image[0x0400:0x0402] = bytes([0x04, 0x20])
-    image[0x0420:0x042B] = bytes([
-        0xF8, 0x08, 0xB6, 0xF8, 0xF0, 0xA6,
-        0xF8, 0xA5, 0x56, 0x30, 0x29,
-    ])
-    cpu = Cpu1802(bytes(image))
-    cpu.run_until(lambda state: state.memory[0x08F0] == 0xA5)
-    assert cpu.p == 3
-    assert cpu.r[3] == 0x0429
-
-
-def test_dispatch_table_and_bytecode_routes() -> None:
-    symbols = define_symbols(SOURCE.read_text(encoding="utf-8").splitlines())
-    handlers = [
-        "unsupported", "op_jump", "op_call", "op_jnz",
-        "op_jz", "op_skip_imm", "op_load_imm", "op_add_imm",
-        "op_alu", "op_memory", "op_index", "op_store_indexed",
-        "op_return_random", "op_key", "op_graphics", "op_extended",
-    ]
-    table = firmware()[symbols["dispatch_table"]:symbols["dispatch_table"] + 32]
-    expected = b"".join(symbols[name].to_bytes(2, "big") for name in handlers)
-    assert table == expected
-
-    cpu = run_cartridge({
-        0x0400: [0x14, 0x10],
-        0x0410: [0x24, 0x30, 0x07, 0x00],
-        0x0430: [
-            0x61, 0x01,       # V1 = 1
-            0x31, 0x36,       # branch because V1 is nonzero
+def test_boot_and_basic_chip8_execution() -> None:
+    cpu = chip8_cpu({
+        0x0200: [
+            0x60, 0x01,       # V0 = 1
+            0x70, 0x02,       # V0 = 3
+            0x30, 0x03,       # skip next because V0 == 3
             0x61, 0xEE,
-            0x41, 0x3A,       # do not branch because V1 is nonzero
-            0x51, 0xFF,       # skip the next two bytes
-            0x61, 0xEE,
-            0x61, 0x00,
-            0x41, 0x42,       # branch because V1 is zero
-            0x61, 0xEE,
-            0x51, 0x00,       # equal, so do not skip
-            0x64, 0x3C,
-            0x62, 0xA5,
-            0x63, 0x5A,
-            0x82, 0x33,       # V2 ^= V3
-            0x94, 0x21,       # V4 -> V2
-            0x60, 0x02,
-            0x70, 0x50,       # loop until V0 reaches its terminal value
-            0xA8, 0x80,
-            0xB0, 0xA5,
-            0xF5, 0xA6,
-            0x66, 0xFF,
-            0x67, 0x82,
-            0x96, 0x78,       # BCD V6 at page-8 address in V7
-            0xC8, 0x00,
-            0xC0,
+            0x61, 0x22,       # V1 = 0x22
+            0xA4, 0x56,       # I = 0x456
+            0x12, 0x0C,       # loop here
         ],
     })
-    assert cpu.memory[0x08C0] == 1
-    assert cpu.memory[0x08C1] == 0
-    assert cpu.memory[0x08C2] == 0x3C
-    assert cpu.memory[0x08C5] == 0xA5
-    assert cpu.memory[0x08C7] == 0x84
-    assert cpu.memory[0x08C8] == 0
-    assert cpu.memory[0x08CB] == 0
-    assert cpu.memory[0x0880] == 0xA5
-    assert cpu.memory[0x0882:0x0885] == bytes([2, 5, 5])
-
-    for program in ([0x81, 0x20], [0x91, 0x23]):
-        trapped = cartridge_cpu({0x0400: program})
-        trapped.run_until(
-            lambda state: state.p == 3
-            and state.r[3] == symbols["unsupported"]
-        )
+    run_until(cpu, lambda s: s.memory[0x08A1] == 0x22 and s.r[10] == 0x0456)
+    assert cpu.video_on
+    assert cpu.memory[0x08A0] == 3
+    assert cpu.memory[0x08A1] == 0x22
+    assert cpu.r[10] == 0x0456
 
 
-def test_key_dispatch() -> None:
-    cpu = run_cartridge(
-        {
-            0x0400: [
-                0x6A, 0x01,
-                0xD5, 0x0A,
-                0x61, 0x11,
-                0x07, 0x00,
-            ],
-            0x040A: [0x61, 0x22, 0x07, 0x00],
-        },
-        lambda state: state.ef.__setitem__(3, 1),
-    )
-    assert cpu.last_output[2] == 5
-    assert cpu.memory[0x08CB] == 5
-    assert cpu.memory[0x08C1] == 0x22
-
-
-def test_graphics_load_draw_and_collision() -> None:
-    setup = [
-        0x69, 0x00,
-        0xA8, 0xD0,
-        0xB0, 0x10,
-        0xA8, 0xD8,
-        0xB0, 0x04,
-        0xA4, 0x80,
-        0xE4,
-    ]
-    source = [0x80, 0x40, 0x20, 0x10]
-
-    drawn = run_cartridge({
-        0x0400: setup + [0xE8, 0xFF, 0x07, 0x00],
-        0x0480: source,
-    })
-    assert drawn.r[10] == 0x0484
-    assert drawn.memory[0x0800:0x0808:2] == bytes(source)
-    assert [drawn.memory[address] for address in (0x0910, 0x0918, 0x0920, 0x0928)] == source
-
-    collided = run_cartridge({
-        0x0400: setup + [
-            0xE8, 0xFF,
-            0xE8, 0x15,
-            0x61, 0xEE,
-            0xFF, 0xFF,
-            0x61, 0x22,
-            0x07, 0x00,
+def test_call_and_return() -> None:
+    cpu = chip8_cpu({
+        0x0200: [
+            0x22, 0x08,       # call 0x208
+            0x61, 0x22,       # V1 = 0x22 after return
+            0x12, 0x04,
         ],
-        0x0480: source,
-    })
-    assert collided.memory[0x08C1] == 0x22
-    assert not any(collided.memory[0x0900:0x0A00])
-
-
-def test_graphics_move_and_clear() -> None:
-    cpu = run_cartridge({
-        0x0400: [
-            0x69, 0x00,
-            0xA8, 0xD0,
-            0xB0, 0x10,
-            0xA8, 0xD8,
-            0xB0, 0x01,
-            0xA8, 0xE0,
-            0xB0, 0x06,
-            0xA4, 0x80,
-            0xE4,
-            0xE1,
-            0x6C, 0x08,
-            0xE2,
-            0xE8, 0xFF,
-            0xE0,
-            0x6C, 0x03,
-            0xE2,
-            0x61, 0xEE,
-            0x61, 0x22,
-            0x07, 0x00,
+        0x0208: [
+            0x60, 0x33,       # V0 = 0x33
+            0x00, 0xEE,
         ],
-        0x0480: [0xFF],
     })
-    assert cpu.memory[0x08D0] == 0x19
-    assert cpu.memory[0x08D8] == 0x81
-    assert cpu.memory[0x08E0] == 0x06
-    assert cpu.memory[0x08E8] == 0xFF
-    assert cpu.memory[0x08F0] == 0xFF
-    assert cpu.memory[0x0918:0x091A] == bytes([0x7F, 0x80])
-    assert not any(cpu.memory[0x0800:0x0810]), cpu.memory[0x0800:0x0810]
-    assert cpu.memory[0x08C1] == 0x22
+    run_until(cpu, lambda s: s.memory[0x08A0] == 0x33 and s.memory[0x08A1] == 0x22)
+    assert cpu.memory[0x08B4] == 0
 
 
-def test_graphics_move_left_and_up() -> None:
-    cpu = run_cartridge({
-        0x0400: [
-            0x69, 0x00,
-            0xA8, 0xD0,
-            0xB0, 0x40,
-            0xA8, 0xD8,
-            0xB0, 0x01,
-            0xA4, 0x80,
-            0xE4,
-            0x6C, 0x04,
-            0xE2,
-            0x6C, 0x02,
-            0xE2,
-            0xE8, 0xFF,
-            0x07, 0x00,
+def test_register_skips() -> None:
+    cpu = chip8_cpu({
+        0x0200: [
+            0x60, 0x44,
+            0x61, 0x44,
+            0x50, 0x10,       # equal: skip V2 = 0xEE
+            0x62, 0xEE,
+            0x90, 0x10,       # equal: do not skip
+            0x62, 0x22,
+            0x41, 0x45,       # V1 != 0x45: skip V3 = 0xEE
+            0x63, 0xEE,
+            0x63, 0x33,
+            0x12, 0x12,
         ],
-        0x0480: [0xFF],
     })
-    assert cpu.memory[0x0800:0x0802] == bytes([0xFE, 0x01])
-    assert cpu.memory[0x08D0] == 0x38
-    assert cpu.memory[0x08D8] == 0x01
-    assert cpu.memory[0x08E8] == 0xFF
-    assert cpu.memory[0x08F0] == 0xFF
-    assert cpu.memory[0x0937:0x0939] == bytes([0x01, 0xFE])
+    run_until(cpu, lambda s: s.memory[0x08A2] == 0x22 and s.memory[0x08A3] == 0x33)
+    assert cpu.memory[0x08A2] == 0x22
+    assert cpu.memory[0x08A3] == 0x33
+
+
+def test_program_counter_crosses_split_mapping() -> None:
+    cpu = chip8_cpu({
+        0x0200: [0x16, 0xFE], # jump to logical 0x6FE
+        0x06FE: [0x60, 0x01], # fetch ends at physical 0x800 -> remap to 0xC00
+        0x0700: [
+            0x70, 0x01,       # V0 becomes 2 after the discontinuity
+            0x17, 0x02,
+        ],
+    })
+    run_until(cpu, lambda s: s.memory[0x08A0] == 2)
+    assert cpu.r[5] == 0x0C02
+
+
+def test_clear_screen() -> None:
+    cpu = chip8_cpu({0x0200: [0x12, 0x00]})
+    run_until(cpu, lambda s: s.video_on)
+    cpu.memory[0x0900:0x0A00] = bytes([0xFF]) * 0x100
+    cpu.memory[0x0300:0x0304] = bytes([0x00, 0xE0, 0x12, 0x00])
+    run_until(cpu, lambda s: not any(s.memory[0x0900:0x0A00]))
 
 
 if __name__ == "__main__":
-    test_builtin_splash()
-    test_display_enable_does_not_alias_dma_register()
-    test_interrupt_vector_reenters_handler()
-    test_native_cartridge_entry()
-    test_dispatch_table_and_bytecode_routes()
-    test_key_dispatch()
-    test_graphics_load_draw_and_collision()
-    test_graphics_move_and_clear()
-    test_graphics_move_left_and_up()
-    print("OpenStudio2 focused execution checks passed")
+    test_firmware_stays_below_chip8_program_area()
+    test_boot_and_basic_chip8_execution()
+    test_call_and_return()
+    test_register_skips()
+    test_program_counter_crosses_split_mapping()
+    test_clear_screen()
+    print("OpenStudio2 initial CHIP-8 execution checks passed")
