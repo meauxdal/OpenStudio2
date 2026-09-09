@@ -115,18 +115,17 @@ irq:
         nop
         shlc
         str r2
-        inc r9
 
         ldi VIDEO_PAGE
         phi r0
         glo rb
         plo r0
         sex r2
+        idl
+        glo rb
 
-; Rewind after each of the first three DMA bursts; keep the fourth advance.
+; The first DMA burst releases IDL. Repeat each row four times, then advance.
 video_rows:
-        glo r0
-        sex r2
         dec r0
         plo r0
         sex r2
@@ -136,6 +135,8 @@ video_rows:
         dec r0
         plo r0
         glo r0
+        dec r0
+        plo r0
         bn1 video_rows
 
 wait_display_end:
