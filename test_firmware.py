@@ -496,6 +496,55 @@ def test_alu_xor_dispatch() -> None:
     assert cpu.memory[0x08AF] == 7
 
 
+def test_offset_jump() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for target, offset, expected in ((0x234, 5, 0x239), (0x2FF, 1, 0x300),
+                                     (0xFFF, 1, 0), (0xFF0, 0xFF, 0x0EF),
+                                     (0, 0, 0), (0x800, 0x80, 0x880)):
+        cpu = chip8_cpu({0x200: [0xB0 | (target >> 8), target & 255]})
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        cpu.memory[0x8A0:0x8B0] = bytes([offset] + [0x55] * 15)
+        cpu.r[10] = 0x1456
+        run_until(cpu, lambda c: c.r[c.p] == symbols['op_jump_offset'])
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        assert cpu.r[5] == 0x1000 + expected
+        assert cpu.r[10] == 0x1456
+        assert cpu.memory[0x8A0:0x8B0] == bytes([offset] + [0x55] * 15)
+
+
+def test_random_instruction() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for register in range(16):
+        for mask in (0, 1, 3, 0x37, 0x3F, 0x80, 0xFF):
+            cpu = chip8_cpu({0x200: [0xC0 | register, mask]})
+            run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+            cpu.memory[0x8A0:0x8B0] = bytes([0xA5] * 16)
+            cpu.r[10] = 0x1234
+            run_until(cpu, lambda c: c.r[c.p] == symbols['op_random'])
+            run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+            expected = bytearray([0xA5] * 16)
+            expected[register] = 0x70 & mask
+            assert cpu.memory[0x8A0:0x8B0] == expected
+            assert cpu.r[9] == 0xE270  # First state from the documented reset seed.
+            assert cpu.r[10] == 0x1234
+            assert cpu.r[5] == 0x1202
+
+    # Exercise the native handler over the full period, including zero output.
+    cpu = chip8_cpu({0x200: [0xC5, 0xFF]})
+    run_until(cpu, lambda c: c.r[c.p] == symbols['op_random'])
+    seen = set()
+    counts = [0] * 256
+    for _ in range(65535):
+        cpu.r[cpu.p] = symbols['op_random']
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        state = cpu.r[9]
+        assert state and state not in seen
+        seen.add(state)
+        counts[cpu.memory[0x8A5]] += 1
+    assert cpu.r[9] == 0xACE1
+    assert counts == [255] + [256] * 255
+
+
 def test_key_skips() -> None:
     symbols = define_symbols(SOURCE.read_text().splitlines())
     for key in range(16):
@@ -574,6 +623,8 @@ if __name__ == "__main__":
     test_program_counter_crosses_physical_page_contiguously()
     test_clear_screen()
     test_sprite_drawing()
+    test_offset_jump()
+    test_random_instruction()
     test_key_skips()
     test_alu_xor_dispatch()
     test_wait_key()

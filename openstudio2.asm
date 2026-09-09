@@ -181,6 +181,12 @@ interpreter_entry:
         inp 1
         inc r2
 
+; Nonzero seed for the 16-bit Galois generator; the ISR preserves R9.
+        ldi $AC
+        phi r9
+        ldi $E1
+        plo r9
+
 ; ---------------------------------------------------------------------------
 ; CHIP-8 fetch/decode loop
 ; ---------------------------------------------------------------------------
@@ -189,10 +195,11 @@ interpreter_entry:
 ; RE.0 = second opcode byte
 ; R5   = physical program counter
 ; RA   = physical CHIP-8 I pointer ($1NNN)
+; R9   = pseudorandom state
 ;
 ; Initial instruction subset:
 ;   00E0  00EE  1NNN  2NNN  3XNN  4XNN  5XY0
-;   6XNN  7XNN  8XY0-8XY7  8XYE  9XY0  ANNN  DXYN
+;   6XNN  7XNN  8XY0-8XY7  8XYE  9XY0  ANNN  BNNN  CXNN  DXYN
 ;   EX9E  EXA1  FX0A  FX07  FX15  FX18  FX1E  FX29  FX33  FX55  FX65
 ;
 ; Unsupported instructions intentionally trap at `unsupported`.
@@ -257,6 +264,16 @@ decode:
         ani $F0
         xri $A0
         lbz op_set_i
+
+        glo rf
+        ani $F0
+        xri $B0
+        lbz op_jump_offset
+
+        glo rf
+        ani $F0
+        xri $C0
+        lbz op_random
 
         glo rf
         ani $F0
@@ -1042,6 +1059,48 @@ load_regs_loop:
         dec re
         glo re
         lbnz load_regs_loop
+        lbr interpreter
+
+; BNNN: original-VIP V0 offset, wrapping the logical target to 12 bits.
+op_jump_offset:
+        ldi VREG_LOW
+        plo r6
+        glo re
+        sex r6
+        add
+        plo r5
+        glo rf
+        ani $0F
+        adci 0
+        ani $0F
+        ori CHIP8_BASE
+        phi r5
+        lbr interpreter
+
+; CXNN: advance a right-shifting Galois LFSR (feedback $B400), then mask
+; its low byte with NN. The nonzero state repeats after 65535 calls.
+op_random:
+        ghi r9
+        shr
+        phi r9
+        glo r9
+        shrc
+        plo r9
+        lbnf random_ready
+        ghi r9
+        xri $B4
+        phi r9
+random_ready:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        str r6
+        glo r9
+        sex r6
+        and
+        str r6
         lbr interpreter
 
 ; EX9E / EXA1 / FX0A --------------------------------------------------------
