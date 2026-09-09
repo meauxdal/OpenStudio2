@@ -23,6 +23,9 @@ class Cpu1802:
         self.ef = [0, 0, 0, 0, 0]
         self.last_output = [0] * 8
         self.video_on = False
+        self.keypad_a: set[int] = set()
+        self.keypad_b: set[int] = set()
+        self.key_selections: list[int] = []
 
     def read(self, address: int) -> int:
         return self.memory[address]
@@ -42,6 +45,9 @@ class Cpu1802:
         self.x, self.p, self.ie = 2, 1, 0
 
     def step(self) -> None:
+        selection = self.last_output[2] & 15
+        self.ef[3] = int(selection < 10 and selection in self.keypad_a)
+        self.ef[4] = int(selection < 10 and selection in self.keypad_b)
         opcode = self.fetch()
         high, low = opcode >> 4, opcode & 15
         if high == 0x0:
@@ -76,6 +82,8 @@ class Cpu1802:
         elif high == 0x6:
             if 1 <= low <= 7:
                 self.last_output[low] = self.read(self.r[self.x])
+                if low == 2:
+                    self.key_selections.append(self.last_output[2] & 15)
                 self.r[self.x] = (self.r[self.x] + 1) & 0xFFFF
             elif 9 <= low <= 15:
                 if low == 9:
@@ -476,6 +484,73 @@ def test_sprite_drawing() -> None:
     assert cpu.memory[0x08AF] == 0
 
 
+def test_key_skips() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for key in range(16):
+        for masked in (key, 0xB0 | key):
+            for opcode in (0x9E, 0xA1):
+                for pressed in (False, True):
+                    cpu = chip8_cpu({0x200: [0x63, masked, 0xE3, opcode,
+                                             0x64, 0x11, 0x65, 0x22, 0x12, 0x08]})
+                    digit = key if key < 10 else key - 9
+                    pad = cpu.keypad_a if key < 10 else cpu.keypad_b
+                    if pressed:
+                        pad.add(digit)
+                    # A press on the other pad must not count.
+                    (cpu.keypad_b if key < 10 else cpu.keypad_a).add(digit)
+                    run_until(cpu, lambda c: c.r[c.p] == symbols['key_scan'])
+                    run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+                    skipped = pressed == (opcode == 0x9E)
+                    assert cpu.r[5] == (0x1206 if skipped else 0x1204)
+                    run_until(cpu, lambda c: c.memory[0x08A5] == 0x22)
+                    assert cpu.memory[0x08A4] == (0 if skipped else 0x11)
+                    assert cpu.memory[0x08A3] == masked
+                    assert cpu.key_selections == [digit]
+
+
+def test_wait_key() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for key in range(16):
+        for register in (0, 7, 15):
+            for held in (False, True):
+                cpu = chip8_cpu({0x200: [0x60 | register, 0xEE,
+                                         0xF0 | register, 0x0A, 0x12, 0x04]})
+                pad = cpu.keypad_a if key < 10 else cpu.keypad_b
+                digit = key if key < 10 else key - 9
+                if held:
+                    pad.add(digit)
+                run_until(cpu, lambda c: c.r[c.p] == symbols['key_scan'])
+                if not held:
+                    for _ in range(3000):
+                        cpu.step()
+                        assert cpu.ie == 1
+                        assert cpu.r[5] == 0x1204
+                        assert cpu.memory[0x08A0 + register] == 0xEE
+                    assert set(cpu.key_selections) == set(range(10))
+                    pad.add(digit)
+                run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+                assert cpu.memory[0x08A0 + register] == key
+                assert cpu.r[5] == 0x1204
+                assert all(0 <= d < 10 for d in cpu.key_selections)
+                assert cpu.r[2] == 0x08FF
+    # Held simultaneous keys resolve in ascending virtual order.
+    cpu = chip8_cpu({0x200: [0xF2, 0x0A, 0x12, 0x02]})
+    cpu.keypad_a.update((9, 0))
+    cpu.keypad_b.add(1)
+    run_until(cpu, lambda c: c.r[c.p] == symbols['key_wait_done'])
+    assert cpu.r[13] & 15 == 0
+
+
+def test_unsupported_key_variants() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for group, supported in ((0xE0, {0x9E, 0xA1}),
+                             (0xF0, {0x0A, 0x07, 0x15, 0x18, 0x1E, 0x29, 0x33, 0x55, 0x65})):
+        for low in set(range(256)) - supported:
+            cpu = chip8_cpu({0x200: [group | 3, low]})
+            run_until(cpu, lambda c: c.r[c.p] == symbols['unsupported'])
+            assert not cpu.key_selections
+
+
 if __name__ == "__main__":
     test_firmware_fits_native_rom()
     test_boot_and_basic_chip8_execution()
@@ -487,4 +562,7 @@ if __name__ == "__main__":
     test_program_counter_crosses_physical_page_contiguously()
     test_clear_screen()
     test_sprite_drawing()
+    test_key_skips()
+    test_wait_key()
+    test_unsupported_key_variants()
     print("OpenStudio2 CHIP-8 execution checks passed")
