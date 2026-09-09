@@ -472,6 +472,7 @@ op_alu:
         glo re
         ani $0F
         xri $03
+        lbz op_alu_xor
         glo re
         ani $0F
         xri $04
@@ -1082,16 +1083,16 @@ key_scan:
         str r7
         sex r7
         out 2
-        bn4 key_b_unpressed
+        bn4 key_not_pressed
         lbr key_pressed
-key_b_unpressed:
+key_not_pressed:
         lbr key_unpressed
 key_scan_a:
         glo rd
         str r7
         sex r7
         out 2
-        bn3 key_unpressed
+        bn3 key_not_pressed
         lbr key_pressed
 key_unpressed:
         glo re

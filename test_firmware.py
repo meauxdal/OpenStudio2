@@ -484,6 +484,18 @@ def test_sprite_drawing() -> None:
     assert cpu.memory[0x08AF] == 0
 
 
+def test_alu_xor_dispatch() -> None:
+    cpu = chip8_cpu({0x200: [
+        0x68, 0xA5, 0x63, 0x3C, 0x6F, 0x07,
+        0x88, 0x33,  # V8 ^= V3; Amabie uses this opcode at $361.
+        0x62, 0x01, 0x12, 0x0A,
+    ]})
+    run_until(cpu, lambda c: c.memory[0x08A2] == 1)
+    assert cpu.memory[0x08A8] == 0x99
+    assert cpu.memory[0x08A3] == 0x3C
+    assert cpu.memory[0x08AF] == 7
+
+
 def test_key_skips() -> None:
     symbols = define_symbols(SOURCE.read_text().splitlines())
     for key in range(16):
@@ -563,6 +575,7 @@ if __name__ == "__main__":
     test_clear_screen()
     test_sprite_drawing()
     test_key_skips()
+    test_alu_xor_dispatch()
     test_wait_key()
     test_unsupported_key_variants()
     print("OpenStudio2 CHIP-8 execution checks passed")
