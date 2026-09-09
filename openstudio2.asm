@@ -1,13 +1,29 @@
 ; SPDX-License-Identifier: MIT
 ;
-; OpenStudio2 firmware -- independently written RCA Studio II firmware.
+; OpenStudio2 -- independently written CHIP-8 firmware for RCA Studio II.
+;
+; MiSTer-native CHIP-8 bring-up version. Native Studio II bytecode
+; compatibility is intentionally not provided. OpenStudio2 assumes the core
+; supplies a dedicated 4 KiB CHIP-8 RAM window:
+;
+;   CHIP-8 logical $0000-$0FFF -> CDP1802 physical $1000-$1FFF
+;
+; CHIP-8 programs therefore start at physical $1200. This intentionally drops
+; the split-memory translation required by Marcel van Tongeren's real-hardware
+; Studio II interpreter.
 
 RAM_PAGE       = $08
 VIDEO_PAGE     = $09
-STACK_LOW      = $BF
-VARIABLES_LOW  = $C0
-TIMER_LOW      = $CD
-TIMER_END      = $D0
+CHIP8_BASE      = $10        ; logical $000-$FFF appears at physical $1000-$1FFF
+VREG_LOW       = $A0
+I_HIGH_LOW     = $B0        ; reserved for later memory-backed I if required
+DELAY_LOW      = $B2
+SOUND_LOW      = $B3
+SP_LOW         = $B4
+DRAW_MASK_LOW  = $B5        ; temporary shifted sprite byte
+DRAW_ROW_LOW   = $B6        ; temporary display-row byte offset
+CHIP_STACK_LOW = $C0        ; 16 x 16-bit physical return PCs: $08C0-$08DF
+NATIVE_STACK   = $FF
 
         .org $0000
 
@@ -21,12 +37,13 @@ reset:
         ldi irq & $FF
         plo r1
 
+; R2 is the native CDP1802 interrupt/scratch stack.  CHIP-8's return stack is
+; separate at $08C0-$08DF.
         ldi RAM_PAGE
         phi r2
         phi r6
         phi r7
-        phi r8
-        ldi STACK_LOW
+        ldi NATIVE_STACK
         plo r2
 
         ldi interpreter_entry >> 8
@@ -34,56 +51,52 @@ reset:
         ldi interpreter_entry & $FF
         plo r4
 
-        ldi $04
+; R5 is the physical program counter corresponding to CHIP-8 logical $0200.
+        ldi $12
         phi r5
         ldi 0
         plo r5
 
-; Clear both physical RAM pages before video starts.
-        ldi RAM_PAGE
-        phi ra
+; RA holds the physical pointer for CHIP-8 I ($1NNN).
         ldi 0
+        phi ra
         plo ra
+
+; Clear Studio II RAM and display RAM ($0800-$09FF).
+        ldi RAM_PAGE
+        phi rd
+        ldi 0
+        plo rd
 clear_ram:
         ldi 0
-        str ra
-        inc ra
-        ghi ra
+        str rd
+        inc rd
+        ghi rd
         xri $0A
         bnz clear_ram
 
-; Preserve the documented initial sprite metadata used by Studio software.
-        ldi $D2
-        plo r8
-        ldi $F8
-        str r8
-        inc r8
-        inc r8
-        ldi $15
-        str r8
-        inc r8
-        ldi $11
-        str r8
-        inc r8
-        inc r8
-        inc r8
-        ldi $04
-        str r8
-        inc r8
-        str r8
-        inc r8
-        ldi $01
-        str r8
-        inc r8
-        ldi $02
-        str r8
-        inc r8
-        ldi $05
-        str r8
-        inc r8
-        str r8
+; Install the standard 4x5 CHIP-8 hexadecimal font at logical $000-$04F.
+; This is ordinary writable CHIP-8 memory in the MiSTer-native $1000 window.
+        ldi font_data >> 8
+        phi rd
+        ldi font_data & $FF
+        plo rd
+        ldi CHIP8_BASE
+        phi rc
+        ldi 0
+        plo rc
+        phi re
+        ldi 80
+        plo re
+copy_font:
+        lda rd
+        str rc
+        inc rc
+        dec re
+        glo re
+        bnz copy_font
 
-; Switch away from P=0 before enabling the CDP1861. An immediate DMA request
+; Switch away from P=0 before enabling the CDP1861.  An immediate DMA request
 ; must not advance R0 while it is still the reset-program counter.
         sex r2
         sep r4
@@ -91,8 +104,9 @@ clear_ram:
 irq_return:
         ret
 
-; The interrupt path deliberately preserves D, DF, X and P. R0, R8, R9 and
-; RB.0 retain their original Studio II ABI roles.
+; CDP1861 interrupt service.  This retains the known-good display cadence from
+; the earlier OpenStudio2 prototype, but the old Studio timers are replaced by
+; CHIP-8 delay and sound timers at $08B2/$08B3.
 irq:
         dec r2
         sav
@@ -101,16 +115,16 @@ irq:
         nop
         shlc
         str r2
-        inc r9
 
         ldi VIDEO_PAGE
         phi r0
-        ldi TIMER_END
-        plo r8
         glo rb
         plo r0
         sex r2
+        idl
+        glo rb
 
+; The first DMA burst releases IDL. Repeat each row four times, then advance.
 video_rows:
         dec r0
         plo r0
@@ -120,11 +134,9 @@ video_rows:
         sex r2
         dec r0
         plo r0
-        sex r2
-; Four bursts leave R0 at the next row. Save that base in D; one SEX keeps the
-; following DEC/PLO rewind ahead of the next DMA request.
         glo r0
-        sex r2
+        dec r0
+        plo r0
         bn1 video_rows
 
 wait_display_end:
@@ -132,23 +144,25 @@ wait_display_end:
         plo r0
         b1 wait_display_end
 
-; Decrement the three frame timers from $08CD through $08CF.
-        ldi TIMER_LOW
+; Delay timer: decrement once per display interrupt while nonzero.
+        ldi RAM_PAGE
+        phi r8
+        ldi DELAY_LOW
         plo r8
-timer_loop:
         ldn r8
-        bz timer_next
+        bz delay_done
         smi 1
         str r8
-timer_next:
-        inc r8
-        glo r8
-        xri TIMER_END
-        bnz timer_loop
+delay_done:
 
-        ldi TIMER_LOW
+; Sound timer: decrement once per display interrupt.  Q is asserted while the
+; post-decrement value remains nonzero.
+        ldi SOUND_LOW
         plo r8
         ldn r8
+        bz sound_off
+        smi 1
+        str r8
         bz sound_off
         seq
         br restore_irq
@@ -161,776 +175,886 @@ restore_irq:
         br irq_return
 
 interpreter_entry:
-; INP 1 enables the CDP1861. The input byte is discarded on the stack.
+; INP 1 enables the CDP1861.  The input byte is discarded on the native stack.
         dec r2
         inp 1
         inc r2
 
-; Fetch and dispatch one Studio bytecode instruction. R6 and R7 address the
-; memory-backed Vx and Vy registers at $08C0-$08CF. Native calls are handled
-; before R3 becomes the bytecode handler PC.
+; ---------------------------------------------------------------------------
+; CHIP-8 fetch/decode loop
+; ---------------------------------------------------------------------------
+;
+; RF.0 = first opcode byte
+; RE.0 = second opcode byte
+; R5   = physical program counter
+; RA   = physical CHIP-8 I pointer ($1NNN)
+;
+; Initial instruction subset:
+;   00E0  00EE  1NNN  2NNN  3XNN  4XNN  5XY0
+;   6XNN  7XNN  8XY0-8XY7  8XYE  9XY0  ANNN  DXYN
+;   FX07  FX15  FX18  FX1E  FX29  FX33  FX55  FX65
+;
+; Unsupported instructions intentionally trap at `unsupported`.
+
 interpreter:
         lda r5
         plo rf
-        ani $F0
-        bnz decode_operands
-        glo rf
-        ani $0F
-        phi r3
-        lda r5
-        plo r3
-        sep r3
-        br interpreter
-
-decode_operands:
-        glo rf
-        ani $0F
-        ori VARIABLES_LOW
-        plo r6
-        ldn r5
-        shr
-        shr
-        shr
-        shr
-        ori VARIABLES_LOW
-        plo r7
-
-        glo rf
-        ani $F0
-        shr
-        shr
-        shr
-        adi dispatch_table & $FF
-        plo rc
-        ldi dispatch_table >> 8
-        phi rc
-        lda rc
-        phi r3
-        ldn rc
-        plo r3
-        sep r3
-        br interpreter
-
-op_jump:
-        lda r5
-        plo r5
-        glo rf
-        ani $0F
-        phi r5
-        sep r4
-
-op_call:
         lda r5
         plo re
+
+decode:
+        glo rf
+        ani $F0
+        lbz op_0
+
+        glo rf
+        ani $F0
+        xri $10
+        lbz op_jump
+
+        glo rf
+        ani $F0
+        xri $20
+        lbz op_call
+
+        glo rf
+        ani $F0
+        xri $30
+        lbz op_skip_eq_imm
+
+        glo rf
+        ani $F0
+        xri $40
+        lbz op_skip_ne_imm
+
+        glo rf
+        ani $F0
+        xri $50
+        lbz op_skip_eq_reg
+
+        glo rf
+        ani $F0
+        xri $60
+        lbz op_load_imm
+
+        glo rf
+        ani $F0
+        xri $70
+        lbz op_add_imm
+
+        glo rf
+        ani $F0
+        xri $80
+        lbz op_alu
+
+        glo rf
+        ani $F0
+        xri $90
+        lbz op_skip_ne_reg
+
+        glo rf
+        ani $F0
+        xri $A0
+        lbz op_set_i
+
+        glo rf
+        ani $F0
+        xri $D0
+        lbz op_draw
+
+        glo rf
+        ani $F0
+        xri $F0
+        lbz op_f
+
+        lbr unsupported
+
+; 00E0 / 00EE ---------------------------------------------------------------
+op_0:
+        glo re
+        xri $E0
+        lbz op_clear
+        glo re
+        xri $EE
+        lbz op_return
+        lbr unsupported
+
+op_clear:
+        ldi VIDEO_PAGE
+        phi rd
+        ldi 0
+        plo rd
+clear_display:
+        ldi 0
+        str rd
+        inc rd
+        glo rd
+        bnz clear_display
+        lbr interpreter
+
+; 00EE: pop a physical return PC from the CHIP-8 stack.
+op_return:
+        ldi RAM_PAGE
+        phi r7
+        ldi SP_LOW
+        plo r7
+        ldn r7
+        lbz unsupported
+        smi 1
+        str r7
+        shl
+        adi CHIP_STACK_LOW
+        plo rd
+        ldi RAM_PAGE
+        phi rd
+        ldn rd
+        phi r5
+        inc rd
+        ldn rd
+        plo r5
+        lbr interpreter
+
+; 1NNN / 2NNN ---------------------------------------------------------------
+op_jump:
+        lbr set_pc_nnn
+
+; Store the already-fetched physical return PC, then branch to NNN.
+op_call:
+        ldi RAM_PAGE
+        phi r7
+        ldi SP_LOW
+        plo r7
+        ldn r7
+        smi $10
+        lbdf unsupported
+        ldn r7
+        shl
+        adi CHIP_STACK_LOW
+        plo rd
+        ldi RAM_PAGE
+        phi rd
         ghi r5
-        dec r2
-        str r2
+        str rd
+        inc rd
         glo r5
-        dec r2
-        str r2
+        str rd
+        ldn r7
+        adi 1
+        str r7
+        lbr set_pc_nnn
+
+; Convert CHIP-8 NNN directly to the dedicated physical window $1NNN.
+set_pc_nnn:
         glo rf
         ani $0F
+        ori CHIP8_BASE
         phi r5
         glo re
         plo r5
-        sep r4
+        lbr interpreter
 
-op_jnz:
-        ldn r6
-        lbz skip_operand
-take_short_branch:
-        ldn r5
-        plo r5
-        sep r4
-
-op_jz:
-        ldn r6
-        lbz take_short_branch
-skip_operand:
-        inc r5
-        sep r4
-
-op_skip_imm:
-        lda r5
+; 3XNN / 4XNN ---------------------------------------------------------------
+op_skip_eq_imm:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
         sex r6
-        xor
-        lbz instruction_done
-skip_instruction:
-        inc r5
-        inc r5
-instruction_done:
-        sep r4
+        sd
+        lbz skip_next
+        lbr interpreter
 
+op_skip_ne_imm:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        sex r6
+        sd
+        lbnz skip_next
+        lbr interpreter
+
+; 5XY0 / 9XY0 ---------------------------------------------------------------
+op_skip_eq_reg:
+        glo re
+        ani $0F
+        lbnz unsupported
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
+        xor
+        lbz skip_next
+        lbr interpreter
+
+op_skip_ne_reg:
+        glo re
+        ani $0F
+        lbnz unsupported
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
+        xor
+        lbnz skip_next
+        lbr interpreter
+
+; Advance the physical PC by one CHIP-8 instruction. The dedicated CHIP-8
+; window is contiguous, so no address-boundary translation is required.
+skip_next:
+        inc r5
+        inc r5
+        lbr interpreter
+
+; 6XNN / 7XNN ---------------------------------------------------------------
 op_load_imm:
-        lda r5
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
         str r6
-        sep r4
+        lbr interpreter
 
 op_add_imm:
         glo rf
         ani $0F
-        lbz op_loop
-        lda r5
+        ori VREG_LOW
+        plo r6
+        glo re
         sex r6
         add
         str r6
-        sep r4
-op_loop:
-        ldn r6
-        smi 1
-        lbz skip_operand
-        str r6
-        lbr take_short_branch
+        lbr interpreter
 
+
+; 8XY0-8XY7 / 8XYE ----------------------------------------------------------
+; These use original COSMAC VIP shift semantics: 8XY6 and 8XYE shift VY and
+; store the result in VX. Logic operations leave VF unchanged.
 op_alu:
-        lda r5
+        glo re
         ani $0F
-        smi 1
-        lbz alu_or
-        smi 1
-        lbz alu_and
-        smi 1
-        lbz alu_xor
-        smi 1
-        lbz alu_add
-        smi 1
-        lbz alu_sub
-        smi 1
-        lbz alu_shr
-        smi 1
-        lbz alu_reverse_sub
-        smi 7
-        lbz alu_shl
+        lbz op_alu_move
+        glo re
+        ani $0F
+        xri $01
+        lbz op_alu_or
+        glo re
+        ani $0F
+        xri $02
+        lbz op_alu_and
+        glo re
+        ani $0F
+        xri $03
+        glo re
+        ani $0F
+        xri $04
+        lbz op_alu_add
+        glo re
+        ani $0F
+        xri $05
+        lbz op_alu_sub
+        glo re
+        ani $0F
+        xri $06
+        lbz op_alu_shr
+        glo re
+        ani $0F
+        xri $07
+        lbz op_alu_subn
+        glo re
+        ani $0F
+        xri $0E
+        lbz op_alu_shl
         lbr unsupported
-alu_or:
+
+; Point R6 at VX and R7 at VY. Their high bytes remain fixed at RAM_PAGE.
+alu_xy_move:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
         ldn r7
-        sex r6
+        str r6
+        lbr interpreter
+
+op_alu_move:
+        lbr alu_xy_move
+
+op_alu_or:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
         or
         str r6
-        lbr clear_carry
-alu_and:
-        ldn r7
-        sex r6
+        lbr interpreter
+
+op_alu_and:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
         and
         str r6
-        lbr clear_carry
-alu_xor:
-        ldn r7
-        sex r6
+        lbr interpreter
+
+op_alu_xor:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
         xor
         str r6
-        lbr clear_carry
-alu_add:
-        ldn r7
-        sex r6
+        lbr interpreter
+
+op_alu_add:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r6
+        sex r7
         add
         str r6
-        lbr save_carry
-alu_sub:
+        ldi VREG_LOW + $0F
+        plo r7
+        ldi 0
+        adci 0
+        str r7
+        lbr interpreter
+
+op_alu_sub:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
         ldn r7
         sex r6
         sd
         str r6
-        lbr save_carry
-alu_reverse_sub:
-        ldn r7
-        sex r6
-        sm
-        str r6
-        lbr save_carry
-alu_shr:
-        ldn r7
-        shr
-        str r6
-        lbr save_carry
-alu_shl:
-        ldn r7
-        shl
-        str r6
-        lbr save_carry
-clear_carry:
+        ldi VREG_LOW + $0F
+        plo r7
         ldi 0
-        lbr write_carry
-save_carry:
-        ldi 0
-        shlc
-write_carry:
-        phi re
-        ldi RAM_PAGE
-        phi rd
-        ldi $CB
-        plo rd
-        ghi re
-        str rd
-        sep r4
+        adci 0
+        str r7
+        lbr interpreter
 
-op_memory:
-        lda r5
+op_alu_subn:
+        glo rf
         ani $0F
-        lbz memory_compare
-        smi 1
-        lbz memory_copy
-        smi 1
-        lbz memory_read
-        smi 2
-        lbz memory_write
-        smi 4
-        lbz memory_bcd
-        lbr unsupported
-memory_compare:
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
         ldn r6
         sex r7
-        xor
-        lbz instruction_done
-        lbr skip_instruction
-memory_copy:
-        ldn r6
-        str r7
-        sep r4
-memory_pointer:
-        ldi RAM_PAGE
-        phi rd
-        ldn r7
-        plo rd
-        sep rc
-memory_read:
-        ldi memory_read_back & $FF
-        plo rc
-        ldi memory_read_back >> 8
-        phi rc
-        lbr memory_pointer
-memory_read_back:
-        ldn rd
+        sd
         str r6
-        sep r4
-memory_write:
-        ldi RAM_PAGE
-        phi rd
-        ldn r7
-        plo rd
-        ldn r6
-        str rd
-        sep r4
-memory_bcd:
-        ldn r6
-        phi rf
-        ldi RAM_PAGE
-        phi rd
-        ldn r7
-        plo rd
-        ldi bcd_powers >> 8
-        phi re
-        ldi bcd_powers & $FF
-        plo re
-bcd_digit:
+        ldi VREG_LOW + $0F
+        plo r7
         ldi 0
-        str rd
-bcd_subtract:
-        ghi rf
-        sex re
-        sm
-        lbnf bcd_next
-        phi rf
-        ldn rd
-        adi 1
-        str rd
-        lbr bcd_subtract
-bcd_next:
-        inc rd
-        inc re
-        glo re
-        xri (bcd_powers + 3) & $FF
-        lbnz bcd_digit
-        glo rd
-        smi 1
+        adci 0
         str r7
-        sep r4
-bcd_powers:
-        .byte 100,10,1
+        lbr interpreter
 
-op_index:
-        lda r5
-        plo ra
+op_alu_shr:
         glo rf
         ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r7
+        shr
+        str r6
+        ldi VREG_LOW + $0F
+        plo r7
+        ldi 0
+        adci 0
+        str r7
+        lbr interpreter
+
+op_alu_shl:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r7
+        ldn r7
+        shl
+        str r6
+        ldi VREG_LOW + $0F
+        plo r7
+        ldi 0
+        adci 0
+        str r7
+        lbr interpreter
+
+; ANNN ----------------------------------------------------------------------
+op_set_i:
+        glo rf
+        ani $0F
+        ori CHIP8_BASE
         phi ra
-        sep r4
+        glo re
+        plo ra
+        lbr interpreter
 
-op_store_indexed:
-        lda r5
-        str ra
+; DXYN ----------------------------------------------------------------------
+; XOR N sprite bytes at I onto the 64x32 display and set VF on collision.
+; Coordinates and pixels wrap at both edges, matching the interpreter's
+; existing original-VIP compatibility policy. I itself is not modified.
+;
+; R3.1 = X bit shift, R3.0 = X byte column
+; RF.1 = current Y row, RF.0 = rows remaining
+; RC   = walking sprite pointer, RE.0 = current sprite byte
+; RD   = current display byte, R6/R7 = work-RAM pointers and shift counter
+op_draw:
         glo rf
         ani $0F
-        phi re
-        dec r2
-        sex r2
-        ghi re
-        str r2
+        ori VREG_LOW
+        plo r6
+        ldn r6
+        ani $3F
+        plo r3
+        ani $07
+        phi r3
+        glo r3
+        shr
+        shr
+        shr
+        plo r3
+
+        glo re
+        ani $0F
+        plo rf
+        glo re
+        shr
+        shr
+        shr
+        shr
+        ori VREG_LOW
+        plo r6
+        ldn r6
+        ani $1F
+        phi rf
+
+        ldi VREG_LOW + $0F
+        plo r6
+        ldi 0
+        str r6
+
+        ghi ra
+        phi rc
         glo ra
+        plo rc
+
+        glo rf
+        lbz draw_done
+
+draw_row:
+        lda rc
+        plo re
+
+; Convert (Y, X-byte) to the linear display offset Y*8 + X-byte.
+        ldi DRAW_ROW_LOW
+        plo r7
+        ghi rf
+        shl
+        shl
+        shl
+        str r7
+        glo r3
+        sex r7
+        add
+        plo rd
+        ldi VIDEO_PAGE
+        phi rd
+
+; Left display byte: sprite >> (X & 7).
+        ldi DRAW_MASK_LOW
+        plo r7
+        ghi r3
+        plo r6
+        lbz draw_left_unshifted
+        glo re
+draw_left_shift:
+        shr
+        str r7
+        dec r6
+        glo r6
+        lbz draw_left_ready
+        ldn r7
+        lbr draw_left_shift
+draw_left_unshifted:
+        glo re
+        str r7
+draw_left_ready:
+        ldn rd
+        sex r7
+        and
+        lbz draw_left_no_collision
+        ldi VREG_LOW + $0F
+        plo r6
+        ldi 1
+        str r6
+draw_left_no_collision:
+        ldn rd
+        sex r7
+        xor
+        str rd
+
+; A byte-aligned sprite has no right-hand fragment.
+        ghi r3
+        lbz draw_next_row
+
+; Right display byte: sprite << (8 - (X & 7)).
+        sdi 8
+        plo r6
+        glo re
+draw_right_shift:
+        shl
+        str r7
+        dec r6
+        glo r6
+        lbz draw_right_ready
+        ldn r7
+        lbr draw_right_shift
+draw_right_ready:
+
+; Advance one byte, wrapping byte column 7 back to column 0 of the same row.
+        inc rd
+        glo rd
+        ani $07
+        lbnz draw_right_address_ready
+        glo rd
+        smi 8
+        plo rd
+draw_right_address_ready:
+        ldi VIDEO_PAGE
+        phi rd
+
+        ldn rd
+        sex r7
+        and
+        lbz draw_right_no_collision
+        ldi VREG_LOW + $0F
+        plo r6
+        ldi 1
+        str r6
+draw_right_no_collision:
+        ldn rd
+        sex r7
+        xor
+        str rd
+
+draw_next_row:
+        ghi rf
+        adi 1
+        ani $1F
+        phi rf
+        glo rf
+        smi 1
+        plo rf
+        lbnz draw_row
+draw_done:
+        lbr interpreter
+
+
+; FX07 / FX15 / FX18 ---------------------------------------------------------
+op_f:
+        glo re
+        xri $07
+        lbz op_get_delay
+        glo re
+        xri $15
+        lbz op_set_delay
+        glo re
+        xri $18
+        lbz op_set_sound
+        glo re
+        xri $1E
+        lbz op_add_i
+        glo re
+        xri $29
+        lbz op_font
+        glo re
+        xri $33
+        lbz op_bcd
+        glo re
+        xri $55
+        lbz op_store_regs
+        glo re
+        xri $65
+        lbz op_load_regs
+        lbr unsupported
+
+op_get_delay:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ldi DELAY_LOW
+        plo r7
+        ldn r7
+        str r6
+        lbr interpreter
+
+op_set_delay:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ldi DELAY_LOW
+        plo r7
+        ldn r6
+        str r7
+        lbr interpreter
+
+op_set_sound:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ldi SOUND_LOW
+        plo r7
+        ldn r6
+        str r7
+        lbr interpreter
+
+; FX1E: I += VX, retaining the physical $1NNN representation and wrapping the
+; logical result to 12 bits.
+op_add_i:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo ra
+        sex r6
         add
         plo ra
-        inc r2
-        sep r4
+        ghi ra
+        adci 0
+        ani $0F
+        ori CHIP8_BASE
+        phi ra
+        lbr interpreter
 
-op_return_random:
+; FX29: point I at the 5-byte font sprite for the low nibble of VX.
+op_font:
         glo rf
         ani $0F
-        lbnz op_random
-        lda r2
-        plo r5
-        lda r2
-        phi r5
-        sep r4
-op_random:
-        lda r5
-        str r6
-        inc r9
-        glo r9
-        shr
-        lbnf random_ready
-        xri $B8
-random_ready:
-        plo r9
-        glo r9
-        sex r6
-        and
-        str r6
-        sep r4
-
-op_key:
-        ldi RAM_PAGE
-        phi rd
-        glo rf
-        ani $0F
-        plo re
-        xri $0F
-        bnz key_number_ready
-        ldi $CB
-        plo rd
-        ldn rd
-        plo re
-key_number_ready:
-        dec r2
-        glo re
-        str r2
-        out 2
-        ldi $CA
-        plo rd
-        ldn rd
-        bz key_player_two
-        b3 key_pressed
-key_not_pressed:
-        inc r5
-        sep r4
-key_player_two:
-        bn4 key_not_pressed
-key_pressed:
-        ldi $CB
-        plo rd
-        glo re
-        str rd
-        lbr take_short_branch
-
-op_graphics:
-        br graphics_decode
-
-op_extended:
-        lda r5
-        smi $A6
-        lbz ext_read
-        smi 3
-        lbz ext_write
-        smi 3
-        lbz ext_read_inc
-        smi 3
-        lbz ext_write_inc
-        smi 4
-        lbz ext_index_low
-        smi 3
-        lbz ext_index_or
-        smi $3C
-        lbz ext_clear_page
-        br unsupported
-ext_read:
-        ldn ra
-        str r6
-        sep r4
-ext_write:
-        ldn r6
-        str ra
-        sep r4
-ext_read_inc:
-        lda ra
-        str r6
-        sep r4
-ext_write_inc:
-        ldn r6
-        str ra
-        inc ra
-        sep r4
-ext_index_low:
-        ldn r6
-        plo ra
-        sep r4
-ext_index_or:
-        ldn r6
-        ani $0F
-        str r6
-        sex r6
-        glo ra
-        or
-        plo ra
-        sep r4
-ext_clear_page:
-        ldi 0
-        str ra
-        glo ra
-        dec ra
-        lbnz ext_clear_page
-        sep r4
-
-unsupported:
-        br unsupported
-
-; Opcode E uses eight independently shifted 16-byte pattern buffers. The
-; selected buffer is V9, with its display parameters in $08D0-$08F7.
-graphics_decode:
-        glo rf
-        ani $0F
-        phi rf
-
-        ldi RAM_PAGE
-        phi r6
-        phi r7
-        phi rd
-        phi re
-        ldi $C9
-        plo r7
-        ldn r7
-        ani 7
-        plo r7
-        shl
-        shl
-        shl
-        shl
+        ori VREG_LOW
         plo r6
-        glo r7
-        adi $D0
-        plo r7
-        glo r7
-        adi 8
-        plo rd
-        glo r7
-        adi $10
-        plo re
-
-        ghi rf
-        bz graphics_clear
-        smi 1
-        bz graphics_move_stored
-        smi 1
-        bz graphics_move_variable
-        smi 2
-        bz graphics_load
-        smi 4
-        lbz graphics_draw
-        br unsupported
-
-graphics_clear:
-        ldi $10
-        plo re
-graphics_clear_byte:
-        ldi 0
-        str r6
-        inc r6
-        dec re
-        glo re
-        bnz graphics_clear_byte
-        sep r4
-
-graphics_load:
-        ldn rd
+        ldn r6
         ani $0F
-        plo re
-        bz graphics_done
-graphics_load_row:
-        lda ra
-        sex r6
-        xor
-        str r6
-        inc r6
-        inc r6
-        dec re
-        glo re
-        bnz graphics_load_row
-graphics_done:
-        sep r4
-
-graphics_move_stored:
-        ldn re
-        br graphics_move
-graphics_move_variable:
-        ldi RAM_PAGE
-        phi rc
-        ldi $CC
         plo rc
-        ldn rc
-graphics_move:
-        phi rc
-        smi 2
-        lbz graphics_move_up
-        smi 2
-        lbz graphics_move_left
-        smi 2
-        lbz graphics_move_right
-        smi 2
-        lbz graphics_move_down
-        lbr skip_instruction
-
-graphics_move_up:
-        ldn r7
-        smi 8
-        str r7
-        br graphics_count_vertical
-graphics_move_down:
-        ldn r7
-        adi 8
-        str r7
-graphics_count_vertical:
-        glo r7
-        adi $18
-        plo re
-        ldn re
-        smi 1
-        str re
-        sep r4
-
-graphics_move_right:
         ldi 0
-        phi rc
-        ldn rd
-        ani $0F
         plo re
-        bz graphics_count_horizontal
-graphics_shift_right_row:
-        ldn r6
-        shr
-        str r6
-        inc r6
-        ldn r6
-        shrc
-        str r6
-        inc r6
-        ldn rd
-        ani $80
-        bnz graphics_right_edge_y
-        dec r6
-        ldn r6
-        ani $80
-        inc r6
-        bz graphics_right_no_cross
-        br graphics_right_cross
-graphics_right_edge_y:
-        bnf graphics_right_no_cross
-graphics_right_cross:
-        ldi 1
-        phi rc
-graphics_right_no_cross:
-        dec re
+        glo rc
+        lbz font_offset_done
+font_offset_loop:
         glo re
-        bnz graphics_shift_right_row
-        ghi rc
-        bz graphics_count_horizontal
-        ldn rd
-        xri $80
-        str rd
-        ldn r7
-        adi 1
-        str r7
-        br graphics_count_horizontal
+        adi 5
+        plo re
+        dec rc
+        glo rc
+        lbnz font_offset_loop
+font_offset_done:
+        glo re
+        plo ra
+        ldi CHIP8_BASE
+        phi ra
+        lbr interpreter
 
-graphics_move_left:
-        ldi 0
-        phi rc
-        ldn rd
-        ani $0F
-        plo re
-        bz graphics_count_horizontal
-graphics_shift_left_row:
-        ldn r6
-        shl
-        str r6
-        inc r6
-        ldn r6
-        shlc
-        str r6
-        inc r6
-        ldn rd
-        ani $80
-        bnz graphics_left_edge_x
-        bnf graphics_left_no_cross
-        br graphics_left_cross
-graphics_left_edge_x:
-        dec r6
-        ldn r6
-        ani 1
-        inc r6
-        bz graphics_left_no_cross
-graphics_left_cross:
-        ldi 1
-        phi rc
-graphics_left_no_cross:
-        dec re
-        glo re
-        bnz graphics_shift_left_row
-        ghi rc
-        bz graphics_count_horizontal
-        ldn rd
-        xri $80
-        str rd
-        ldn r7
-        smi 1
-        str r7
-graphics_count_horizontal:
-        glo r7
-        adi $20
-        plo re
-        ldn re
-        smi 1
-        str re
-        sep r4
-
-graphics_draw:
-        ldn rd
-        ani $0F
-        plo re
-        ldi 0
-        phi re
-        ldi VIDEO_PAGE
-        phi rf
-        ldn r7
-        plo rf
-; The dispatcher leaves RC on page 3, where the draw helper also resides.
-        ldi graphics_xor_byte & $FF
-        plo rc
-        sex rf
-        glo re
-        bz graphics_draw_done
-        ldn rd
-        ani $80
-        bnz graphics_draw_reversed
-graphics_draw_row:
-        sep rc
-        inc r6
-        dec rf
-        sep rc
-        inc r6
+; FX33: store decimal hundreds, tens, and ones at I..I+2 without changing I.
+op_bcd:
         glo rf
-        adi 9
-        plo rf
-        dec re
-        glo re
-        bnz graphics_draw_row
-        br graphics_draw_done
-
-graphics_draw_reversed:
-        inc r6
-graphics_draw_reversed_row:
-        sep rc
-        dec r6
-        dec rf
-        sep rc
-        inc r6
-        inc r6
-        glo rf
-        adi 9
-        plo rf
-        dec re
-        glo re
-        bnz graphics_draw_reversed_row
-graphics_draw_done:
-        ghi re
-        lbnz take_short_branch
-        inc r5
-        sep r4
-
-graphics_xor_byte:
-        ldn r6
-        and
-        bz graphics_xor_clear
-        ldi 1
-        phi re
-graphics_xor_clear:
-        ldn r6
-        xor
-        str rf
-        sep r3
-        br graphics_xor_byte
-
-        .org $03E0
-dispatch_table:
-        .byte unsupported >> 8, unsupported & $FF
-        .byte op_jump >> 8, op_jump & $FF
-        .byte op_call >> 8, op_call & $FF
-        .byte op_jnz >> 8, op_jnz & $FF
-        .byte op_jz >> 8, op_jz & $FF
-        .byte op_skip_imm >> 8, op_skip_imm & $FF
-        .byte op_load_imm >> 8, op_load_imm & $FF
-        .byte op_add_imm >> 8, op_add_imm & $FF
-        .byte op_alu >> 8, op_alu & $FF
-        .byte op_memory >> 8, op_memory & $FF
-        .byte op_index >> 8, op_index & $FF
-        .byte op_store_indexed >> 8, op_store_indexed & $FF
-        .byte op_return_random >> 8, op_return_random & $FF
-        .byte op_key >> 8, op_key & $FF
-        .byte op_graphics >> 8, op_graphics & $FF
-        .byte op_extended >> 8, op_extended & $FF
-
-        .org $0400
-
-; With no cartridge loaded, enter an original machine-code splash program.
-        .byte splash >> 8, splash & $FF
-
-        .org $0410
-splash:
-        ldi VIDEO_PAGE
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ghi ra
         phi rd
-        ldi $62
+        glo ra
         plo rd
-        ldi splash_data >> 8
-        phi rf
-        ldi splash_data & $FF
-        plo rf
-        ldi 7
-        plo re
-splash_row:
-        ldi 4
+        ldi 0
+        phi rc
         plo rc
-splash_column:
-        lda rf
+        ldn r6
+bcd_hundreds:
+        smi 100
+        lbnf bcd_hundreds_done
+        inc rc
+        lbr bcd_hundreds
+bcd_hundreds_done:
+        adi 100
+        plo re
+        glo rc
         str rd
         inc rd
-        glo rc
-        smi 1
+        ldi 0
         plo rc
-        bnz splash_column
-        glo rd
-        adi 4
-        plo rd
         glo re
-        smi 1
+bcd_tens:
+        smi 10
+        lbnf bcd_tens_done
+        inc rc
+        lbr bcd_tens
+bcd_tens_done:
+        adi 10
         plo re
-        bnz splash_row
-splash_idle:
-        br splash_idle
+        glo rc
+        str rd
+        inc rd
+        glo re
+        str rd
+        lbr interpreter
 
-splash_data:
-        .byte $7C,$7C,$7C,$66
-        .byte $66,$66,$66,$66
-        .byte $66,$66,$60,$76
-        .byte $66,$7C,$78,$7E
-        .byte $66,$60,$60,$6E
-        .byte $66,$60,$60,$66
-        .byte $7C,$60,$7E,$66
+; FX55 / FX65 use original VIP behavior: transfer V0..VX and advance I by
+; X+1. The dedicated RAM window means there is no Studio-specific remapping.
+op_store_regs:
+        glo rf
+        ani $0F
+        adi 1
+        plo re
+        ldi 0
+        phi re
+        ldi VREG_LOW
+        plo r6
+store_regs_loop:
+        lda r6
+        str ra
+        inc ra
+        dec re
+        glo re
+        lbnz store_regs_loop
+        lbr interpreter
+
+op_load_regs:
+        glo rf
+        ani $0F
+        adi 1
+        plo re
+        ldi 0
+        phi re
+        ldi VREG_LOW
+        plo r6
+load_regs_loop:
+        ldn ra
+        str r6
+        inc ra
+        inc r6
+        dec re
+        glo re
+        lbnz load_regs_loop
+        lbr interpreter
+
+unsupported:
+        lbr unsupported
+
+
+; Standard CHIP-8 4x5 hexadecimal font, copied to logical $000-$04F at reset.
+font_data:
+        .byte $F0,$90,$90,$90,$F0
+        .byte $20,$60,$20,$20,$70
+        .byte $F0,$10,$F0,$80,$F0
+        .byte $F0,$10,$F0,$10,$F0
+        .byte $90,$90,$F0,$10,$10
+        .byte $F0,$80,$F0,$10,$F0
+        .byte $F0,$80,$F0,$90,$F0
+        .byte $F0,$10,$20,$40,$40
+        .byte $F0,$90,$F0,$90,$F0
+        .byte $F0,$90,$F0,$10,$F0
+        .byte $F0,$90,$F0,$90,$90
+        .byte $E0,$90,$E0,$90,$E0
+        .byte $F0,$80,$80,$80,$F0
+        .byte $E0,$90,$90,$90,$E0
+        .byte $F0,$80,$F0,$80,$F0
+        .byte $F0,$80,$F0,$80,$80
 
         .end

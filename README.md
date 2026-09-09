@@ -1,12 +1,80 @@
 # OpenStudio2 firmware
 
-OpenStudio2 is a reimplementation of the RCA Studio II firmware 
-under the MIT License.
+OpenStudio2 is independently written, MIT-licensed CDP1802 firmware for the
+RCA Studio II MiSTer core. The implementation does not use or copy RCA firmware
+code or Marcel van Tongeren's Studio II CHIP-8 interpreter.
 
-The implementation does not use or copy RCA firmware code.
+OpenStudio2 is a clean-room CHIP-8 environment rather than a replacement for
+native Studio II firmware. Retail Studio II cartridges should continue to use
+normal Studio II firmware; Marcel's interpreter remains useful as an optional
+historical compatibility path.
 
-Python 3 is required. The checked-in binary and hexadecimal files
-are generated from `openstudio2.asm`:
+## Current implementation
+
+The current source is a partial CHIP-8 interpreter with reset and RAM
+initialization, CDP1861 video setup, display clearing, a 16-level CHIP-8 return
+stack, delay/sound timers, Q beeper control, a standard 4x5 hexadecimal font,
+and direct access to the MiSTer-native 4 KiB CHIP-8 RAM window.
+
+Implemented CHIP-8 instructions:
+
+- Display and return: `00E0`, `00EE`.
+- Jump and call: `1nnn`, `2nnn`.
+- Conditional skips: `3xkk`, `4xkk`, `5xy0`, `9xy0`.
+- Register load and addition: `6xkk`, `7xkk`.
+- Arithmetic and logic: `8xy0` through `8xy7`, and `8xyE`.
+- Index assignment: `Annn`.
+- Sprite drawing: `Dxyn`, with XOR collision reporting and wrapped edges.
+- Timers and index operations: `Fx07`, `Fx15`, `Fx18`, `Fx1E`.
+- Font and memory operations: `Fx29`, `Fx33`, `Fx55`, `Fx65`.
+
+The arithmetic implementation currently follows original COSMAC VIP behavior:
+`8xy6` and `8xyE` shift `Vy` into `Vx`, logic operations leave `VF` unchanged,
+and `Fx55`/`Fx65` advance `I` by `x + 1`.
+
+Unsupported instructions enter a trap. Random values, offset jumps, key
+handling, and wait-for-key remain unimplemented. Loading and playing real
+CHIP-8 games on the FPGA has not yet been established.
+
+## MiSTer-native memory model
+
+Marcel van Tongeren's real-hardware Studio II interpreter has to split CHIP-8
+program storage around the Studio II memory map and provides only 159 bytes of
+free writable RAM. OpenStudio2 does not preserve those restrictions.
+
+The MiSTer integration gives OpenStudio2 a dedicated contiguous 4 KiB
+CHIP-8 RAM window:
+
+| Purpose | CDP1802 physical address | CHIP-8 logical address |
+|---|---:|---:|
+| OpenStudio2 firmware ROM | `$0000-$07FF` | n/a |
+| Interpreter work RAM | `$0800-$08FF` | n/a |
+| CDP1861 display RAM | `$0900-$09FF` | n/a |
+| Dedicated CHIP-8 RAM | `$1000-$1FFF` | `$000-$FFF` |
+| CHIP-8 font | `$1000-$104F` | `$000-$04F` |
+| CHIP-8 program start | `$1200` | `$200` |
+
+A logical CHIP-8 address `NNN` is therefore represented internally as physical
+`$1NNN`. Sequential program fetches, jumps, calls, `I`, fonts, and data access
+all use the same contiguous mapping. There is no `$06FF->$0700` discontinuity,
+no `$B00-$B9F` RAM alias, and no reduced program-size limit beyond CHIP-8's
+normal 4 KiB address space.
+
+V0-VF occupy `$08A0-$08AF`, delay and sound timers occupy `$08B2-$08B3`, the
+stack pointer is at `$08B4`, and the 16-entry return stack occupies
+`$08C0-$08DF`. Display RAM remains `$0900-$09FF`.
+
+This mapping is implemented by the firmware and MiSTer RTL. OpenStudio2 has its
+own dedicated RAM and loader path, while Marcel's historical interpreter keeps
+its original split program mapping unchanged. Directed Verilator regressions
+cover both interpreter sizes, both loader paths, the `$1FFF` boundary, oversize
+rejection, native/Marcel/OS2 decode isolation, and CPU reads and writes through
+the dedicated RAM.
+
+## Build and validation
+
+Python 3 is required. The checked-in binary and hexadecimal files are generated
+from `openstudio2.asm`:
 
 ```text
 python build.py
@@ -14,52 +82,30 @@ python build.py --check
 python test_firmware.py
 ```
 
-`openstudio2.bin` is the canonical 2 KiB ROM image. `openstudio2.hex` is a
-4 KiB, one-byte-per-line hexadecimal image suitable for FPGA block-RAM
-initialization; its upper 2 KiB are filled with `FF`.
+`openstudio2.bin` is the canonical 2 KiB ROM image, with unused bytes filled
+with `FF`. `openstudio2.hex` is a 4 KiB, one-byte-per-line hexadecimal image
+suitable for FPGA block-RAM initialization; its upper 2 KiB are also `FF`.
 
-The prototype supplies reset, RAM initialization, CDP1861 video, frame timers,
-beeper control, native `0nnn` machine calls, and these Studio II bytecode
-instructions:
+`openstudio2-dxyn-smoke.ch8` is a tiny visual hardware check. Load
+`openstudio2.bin` as the CHIP-8 interpreter, then load the smoke test as the
+CHIP-8 program. It draws `0` at the top left and `F` from `(63,31)`, wrapping
+the latter across the right and bottom edges. Its matching `.hex` file records
+the complete 24-byte test program in readable form.
 
-- Control: `1nnn`, `2nnn`, `3xaa`, `4xaa`, `5xkk`, `70aa`, and `C0`.
-- Variables and arithmetic: `6xkk`, `7xkk` for `x=1-F`, and
-  `8xy1/2/3/4/5/6/7/E`.
-- Memory and index: `9xy0/1/2/4/8`, `Annn`, `Bnkk`, and
-  `FxA6/A9/AC/AF/B3/B6/F2`.
-- Input and random values: `Cxkk` for `x=1-F` and `Dkaa`.
-- Graphics: `E0`, `E1`, `E2`, `E4`, and `E8aa`.
+The focused Python execution checks cover firmware bounds, boot/basic
+execution, call/return, register skips, VIP-style arithmetic, timer
+instructions, font/BCD/register memory operations, contiguous program fetch
+across a physical page boundary, screen clearing, aligned and unaligned sprite
+drawing, collision reporting, and horizontal/vertical edge wrapping. They use
+small programs written for this project without original RCA or Marcel
+interpreter bytes.
 
-Graphics use the eight 16-byte pattern buffers selected by V9. `E0` clears a
-buffer, `E1` moves it using its stored direction, `E2` moves it using VC,
-`E4` XOR-loads its configured number of rows from the index address, and
-`E8aa` XOR-draws it with a collision branch. Directions are 2 up, 4 left,
-6 right, and 8 down; other direction values skip the following two-byte
-instruction.
-
-Undefined encodings deliberately enter a trap. The focused checks use small
-cartridge programs written for this project to exercise dispatch, subroutine
-flow, keypad input, graphics loading and clearing, all four movement
-directions, XOR drawing, and collision branches. No original cartridge or RCA
-firmware bytes are test inputs.
-
-The behavior was implemented from the published language and memory-map
-descriptions in RCA's September 1977
-[Programming Manual for STUDIO III](https://bitsavers.org/components/rca/cosmac/Programming_Manual_for_STUDIO_III_Sep77.pdf).
-
-Compatibility with original cartridges is not established in this prototype.
-
-## Validation
-
-The firmware has passed its focused Python checks, all 32 reset-release phases
-of the MiSTer core's Verilator rewind/cadence regression, and 120-frame soaks at
-phases 0 and 28. The clean simulated frame hash was `BB31B0B5`. Hardware testing
-produced a clean OPEN splash, stable repeated resets, and no malformed or black
-starts.
-
-For MiSTer firmware-only testing, copy `openstudio2.bin` to
-`/media/fat/games/Studio-II/boot0.rom`. No RBF rebuild is required.
+These checks do not validate CDP1861 interrupt/DMA timing, 60 Hz timer cadence,
+audio timing, keypad behavior, real game compatibility, FPGA RAM inference, or
+physical hardware behavior. No new Quartus or hardware validation is claimed
+for this revision.
 
 ## License
 
-OpenStudio2 is available under the [MIT License](LICENSE).
+OpenStudio2 is available under the [MIT License](LICENSE). Preserve its
+copyright and permission notice when redistributing the firmware.
