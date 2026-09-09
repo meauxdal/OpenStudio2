@@ -123,18 +123,19 @@ irq:
         plo r0
         sex r2
 
+; Rewind after each of the first three DMA bursts; keep the fourth advance.
 video_rows:
-        dec r0
-        plo r0
-        sex r2
-        dec r0
-        plo r0
-        sex r2
-        dec r0
-        plo r0
-        sex r2
         glo r0
         sex r2
+        dec r0
+        plo r0
+        sex r2
+        dec r0
+        plo r0
+        sex r2
+        dec r0
+        plo r0
+        glo r0
         bn1 video_rows
 
 wait_display_end:
