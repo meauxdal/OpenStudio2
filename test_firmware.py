@@ -23,6 +23,9 @@ class Cpu1802:
         self.ef = [0, 0, 0, 0, 0]
         self.last_output = [0] * 8
         self.video_on = False
+        self.keypad_a: set[int] = set()
+        self.keypad_b: set[int] = set()
+        self.key_selections: list[int] = []
 
     def read(self, address: int) -> int:
         return self.memory[address]
@@ -42,6 +45,9 @@ class Cpu1802:
         self.x, self.p, self.ie = 2, 1, 0
 
     def step(self) -> None:
+        selection = self.last_output[2] & 15
+        self.ef[3] = int(selection < 10 and selection in self.keypad_a)
+        self.ef[4] = int(selection < 10 and selection in self.keypad_b)
         opcode = self.fetch()
         high, low = opcode >> 4, opcode & 15
         if high == 0x0:
@@ -76,6 +82,8 @@ class Cpu1802:
         elif high == 0x6:
             if 1 <= low <= 7:
                 self.last_output[low] = self.read(self.r[self.x])
+                if low == 2:
+                    self.key_selections.append(self.last_output[2] & 15)
                 self.r[self.x] = (self.r[self.x] + 1) & 0xFFFF
             elif 9 <= low <= 15:
                 if low == 9:
@@ -476,6 +484,134 @@ def test_sprite_drawing() -> None:
     assert cpu.memory[0x08AF] == 0
 
 
+def test_alu_xor_dispatch() -> None:
+    cpu = chip8_cpu({0x200: [
+        0x68, 0xA5, 0x63, 0x3C, 0x6F, 0x07,
+        0x88, 0x33,  # V8 ^= V3; Amabie uses this opcode at $361.
+        0x62, 0x01, 0x12, 0x0A,
+    ]})
+    run_until(cpu, lambda c: c.memory[0x08A2] == 1)
+    assert cpu.memory[0x08A8] == 0x99
+    assert cpu.memory[0x08A3] == 0x3C
+    assert cpu.memory[0x08AF] == 7
+
+
+def test_offset_jump() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for target, offset, expected in ((0x234, 5, 0x239), (0x2FF, 1, 0x300),
+                                     (0xFFF, 1, 0), (0xFF0, 0xFF, 0x0EF),
+                                     (0, 0, 0), (0x800, 0x80, 0x880)):
+        cpu = chip8_cpu({0x200: [0xB0 | (target >> 8), target & 255]})
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        cpu.memory[0x8A0:0x8B0] = bytes([offset] + [0x55] * 15)
+        cpu.r[10] = 0x1456
+        run_until(cpu, lambda c: c.r[c.p] == symbols['op_jump_offset'])
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        assert cpu.r[5] == 0x1000 + expected
+        assert cpu.r[10] == 0x1456
+        assert cpu.memory[0x8A0:0x8B0] == bytes([offset] + [0x55] * 15)
+
+
+def test_random_instruction() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for register in range(16):
+        for mask in (0, 1, 3, 0x37, 0x3F, 0x80, 0xFF):
+            cpu = chip8_cpu({0x200: [0xC0 | register, mask]})
+            run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+            cpu.memory[0x8A0:0x8B0] = bytes([0xA5] * 16)
+            cpu.r[10] = 0x1234
+            run_until(cpu, lambda c: c.r[c.p] == symbols['op_random'])
+            run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+            expected = bytearray([0xA5] * 16)
+            expected[register] = 0x70 & mask
+            assert cpu.memory[0x8A0:0x8B0] == expected
+            assert cpu.r[9] == 0xE270  # First state from the documented reset seed.
+            assert cpu.r[10] == 0x1234
+            assert cpu.r[5] == 0x1202
+
+    # Exercise the native handler over the full period, including zero output.
+    cpu = chip8_cpu({0x200: [0xC5, 0xFF]})
+    run_until(cpu, lambda c: c.r[c.p] == symbols['op_random'])
+    seen = set()
+    counts = [0] * 256
+    for _ in range(65535):
+        cpu.r[cpu.p] = symbols['op_random']
+        run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+        state = cpu.r[9]
+        assert state and state not in seen
+        seen.add(state)
+        counts[cpu.memory[0x8A5]] += 1
+    assert cpu.r[9] == 0xACE1
+    assert counts == [255] + [256] * 255
+
+
+def test_key_skips() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for key in range(16):
+        for masked in (key, 0xB0 | key):
+            for opcode in (0x9E, 0xA1):
+                for pressed in (False, True):
+                    cpu = chip8_cpu({0x200: [0x63, masked, 0xE3, opcode,
+                                             0x64, 0x11, 0x65, 0x22, 0x12, 0x08]})
+                    digit = key if key < 10 else key - 9
+                    pad = cpu.keypad_a if key < 10 else cpu.keypad_b
+                    if pressed:
+                        pad.add(digit)
+                    # A press on the other pad must not count.
+                    (cpu.keypad_b if key < 10 else cpu.keypad_a).add(digit)
+                    run_until(cpu, lambda c: c.r[c.p] == symbols['key_scan'])
+                    run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+                    skipped = pressed == (opcode == 0x9E)
+                    assert cpu.r[5] == (0x1206 if skipped else 0x1204)
+                    run_until(cpu, lambda c: c.memory[0x08A5] == 0x22)
+                    assert cpu.memory[0x08A4] == (0 if skipped else 0x11)
+                    assert cpu.memory[0x08A3] == masked
+                    assert cpu.key_selections == [digit]
+
+
+def test_wait_key() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for key in range(16):
+        for register in (0, 7, 15):
+            for held in (False, True):
+                cpu = chip8_cpu({0x200: [0x60 | register, 0xEE,
+                                         0xF0 | register, 0x0A, 0x12, 0x04]})
+                pad = cpu.keypad_a if key < 10 else cpu.keypad_b
+                digit = key if key < 10 else key - 9
+                if held:
+                    pad.add(digit)
+                run_until(cpu, lambda c: c.r[c.p] == symbols['key_scan'])
+                if not held:
+                    for _ in range(3000):
+                        cpu.step()
+                        assert cpu.ie == 1
+                        assert cpu.r[5] == 0x1204
+                        assert cpu.memory[0x08A0 + register] == 0xEE
+                    assert set(cpu.key_selections) == set(range(10))
+                    pad.add(digit)
+                run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+                assert cpu.memory[0x08A0 + register] == key
+                assert cpu.r[5] == 0x1204
+                assert all(0 <= d < 10 for d in cpu.key_selections)
+                assert cpu.r[2] == 0x08FF
+    # Held simultaneous keys resolve in ascending virtual order.
+    cpu = chip8_cpu({0x200: [0xF2, 0x0A, 0x12, 0x02]})
+    cpu.keypad_a.update((9, 0))
+    cpu.keypad_b.add(1)
+    run_until(cpu, lambda c: c.r[c.p] == symbols['key_wait_done'])
+    assert cpu.r[13] & 15 == 0
+
+
+def test_unsupported_key_variants() -> None:
+    symbols = define_symbols(SOURCE.read_text().splitlines())
+    for group, supported in ((0xE0, {0x9E, 0xA1}),
+                             (0xF0, {0x0A, 0x07, 0x15, 0x18, 0x1E, 0x29, 0x33, 0x55, 0x65})):
+        for low in set(range(256)) - supported:
+            cpu = chip8_cpu({0x200: [group | 3, low]})
+            run_until(cpu, lambda c: c.r[c.p] == symbols['unsupported'])
+            assert not cpu.key_selections
+
+
 if __name__ == "__main__":
     test_firmware_fits_native_rom()
     test_boot_and_basic_chip8_execution()
@@ -487,4 +623,10 @@ if __name__ == "__main__":
     test_program_counter_crosses_physical_page_contiguously()
     test_clear_screen()
     test_sprite_drawing()
+    test_offset_jump()
+    test_random_instruction()
+    test_key_skips()
+    test_alu_xor_dispatch()
+    test_wait_key()
+    test_unsupported_key_variants()
     print("OpenStudio2 CHIP-8 execution checks passed")

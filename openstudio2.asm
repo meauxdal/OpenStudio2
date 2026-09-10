@@ -22,6 +22,7 @@ SOUND_LOW      = $B3
 SP_LOW         = $B4
 DRAW_MASK_LOW  = $B5        ; temporary shifted sprite byte
 DRAW_ROW_LOW   = $B6        ; temporary display-row byte offset
+KEY_SELECT_LOW = $B7        ; physical digit for OUT 2
 CHIP_STACK_LOW = $C0        ; 16 x 16-bit physical return PCs: $08C0-$08DF
 NATIVE_STACK   = $FF
 
@@ -180,6 +181,12 @@ interpreter_entry:
         inp 1
         inc r2
 
+; Nonzero seed for the 16-bit Galois generator; the ISR preserves R9.
+        ldi $AC
+        phi r9
+        ldi $E1
+        plo r9
+
 ; ---------------------------------------------------------------------------
 ; CHIP-8 fetch/decode loop
 ; ---------------------------------------------------------------------------
@@ -188,11 +195,12 @@ interpreter_entry:
 ; RE.0 = second opcode byte
 ; R5   = physical program counter
 ; RA   = physical CHIP-8 I pointer ($1NNN)
+; R9   = pseudorandom state
 ;
 ; Initial instruction subset:
 ;   00E0  00EE  1NNN  2NNN  3XNN  4XNN  5XY0
-;   6XNN  7XNN  8XY0-8XY7  8XYE  9XY0  ANNN  DXYN
-;   FX07  FX15  FX18  FX1E  FX29  FX33  FX55  FX65
+;   6XNN  7XNN  8XY0-8XY7  8XYE  9XY0  ANNN  BNNN  CXNN  DXYN
+;   EX9E  EXA1  FX0A  FX07  FX15  FX18  FX1E  FX29  FX33  FX55  FX65
 ;
 ; Unsupported instructions intentionally trap at `unsupported`.
 
@@ -259,8 +267,23 @@ decode:
 
         glo rf
         ani $F0
+        xri $B0
+        lbz op_jump_offset
+
+        glo rf
+        ani $F0
+        xri $C0
+        lbz op_random
+
+        glo rf
+        ani $F0
         xri $D0
         lbz op_draw
+
+        glo rf
+        ani $F0
+        xri $E0
+        lbz op_e
 
         glo rf
         ani $F0
@@ -466,6 +489,7 @@ op_alu:
         glo re
         ani $0F
         xri $03
+        lbz op_alu_xor
         glo re
         ani $0F
         xri $04
@@ -849,6 +873,9 @@ draw_done:
 ; FX07 / FX15 / FX18 ---------------------------------------------------------
 op_f:
         glo re
+        xri $0A
+        lbz op_wait_key
+        glo re
         xri $07
         lbz op_get_delay
         glo re
@@ -1032,6 +1059,125 @@ load_regs_loop:
         dec re
         glo re
         lbnz load_regs_loop
+        lbr interpreter
+
+; BNNN: original-VIP V0 offset, wrapping the logical target to 12 bits.
+op_jump_offset:
+        ldi VREG_LOW
+        plo r6
+        glo re
+        sex r6
+        add
+        plo r5
+        glo rf
+        ani $0F
+        adci 0
+        ani $0F
+        ori CHIP8_BASE
+        phi r5
+        lbr interpreter
+
+; CXNN: advance a right-shifting Galois LFSR (feedback $B400), then mask
+; its low byte with NN. The nonzero state repeats after 65535 calls.
+op_random:
+        ghi r9
+        shr
+        phi r9
+        glo r9
+        shrc
+        plo r9
+        lbnf random_ready
+        ghi r9
+        xri $B4
+        phi r9
+random_ready:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        glo re
+        str r6
+        glo r9
+        sex r6
+        and
+        str r6
+        lbr interpreter
+
+; EX9E / EXA1 / FX0A --------------------------------------------------------
+op_e:
+        glo re
+        xri $9E
+        lbz key_skip_setup
+        glo re
+        xri $A1
+        lbnz unsupported
+key_skip_setup:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ldn r6
+        ani $0F
+        plo rd
+        lbr key_scan
+
+; Level-sensitive wait: scan virtual 0-F repeatedly, accepting held keys.
+; R6 retains VX, RD.0 retains the candidate; the ISR preserves both.
+op_wait_key:
+        glo rf
+        ani $0F
+        ori VREG_LOW
+        plo r6
+        ldi 0
+        plo rd
+
+; OUT 2 selects A0-A9 or B1-B6; CD4515 outputs 10-15 are unconnected.
+key_scan:
+        ldi KEY_SELECT_LOW
+        plo r7
+        glo rd
+        smi 10
+        lbnf key_scan_a
+        adi 1
+        str r7
+        sex r7
+        out 2
+        bn4 key_not_pressed
+        lbr key_pressed
+key_not_pressed:
+        lbr key_unpressed
+key_scan_a:
+        glo rd
+        str r7
+        sex r7
+        out 2
+        bn3 key_not_pressed
+        lbr key_pressed
+key_unpressed:
+        glo re
+        xri $0A
+        lbz key_wait_next
+        glo re
+        xri $A1
+        lbz skip_next
+        lbr interpreter
+key_pressed:
+        glo re
+        xri $0A
+        lbz key_wait_done
+        glo re
+        xri $9E
+        lbz skip_next
+        lbr interpreter
+key_wait_next:
+        glo rd
+        adi 1
+        ani $0F
+        plo rd
+        lbr key_scan
+key_wait_done:
+        glo rd
+        str r6
         lbr interpreter
 
 unsupported:

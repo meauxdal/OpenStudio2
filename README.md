@@ -19,9 +19,11 @@ and direct access to the MiSTer-native 4 KiB CHIP-8 RAM window.
 Implemented CHIP-8 instructions:
 
 - Display and return: `00E0`, `00EE`.
-- Jump and call: `1nnn`, `2nnn`.
+- Jump and call: `1nnn`, `2nnn`, `Bnnn` (V0 offset).
 - Conditional skips: `3xkk`, `4xkk`, `5xy0`, `9xy0`.
+- Key input: `Ex9E`, `ExA1`, `Fx0A`.
 - Register load and addition: `6xkk`, `7xkk`.
+- Masked pseudorandom byte: `Cxkk`.
 - Arithmetic and logic: `8xy0` through `8xy7`, and `8xyE`.
 - Index assignment: `Annn`.
 - Sprite drawing: `Dxyn`, with XOR collision reporting and wrapped edges.
@@ -30,11 +32,32 @@ Implemented CHIP-8 instructions:
 
 The arithmetic implementation currently follows original COSMAC VIP behavior:
 `8xy6` and `8xyE` shift `Vy` into `Vx`, logic operations leave `VF` unchanged,
-and `Fx55`/`Fx65` advance `I` by `x + 1`.
+and `Fx55`/`Fx65` advance `I` by `x + 1`. `Bnnn` adds `V0` to `nnn`,
+wrapping the logical target to 12 bits.
 
-Unsupported instructions enter a trap. Random values, offset jumps, key
-handling, and wait-for-key remain unimplemented. Loading and playing real
-CHIP-8 games on the FPGA has not yet been established.
+`Cxkk` advances a 16-bit right-shifting Galois generator with feedback `$B400`
+and stores its low byte AND `kk` in `Vx`. R9 holds its state, seeded to `$ACE1`
+at reset. The sequence repeats after 65,535 calls; a zero mask still advances
+it. Resets reproduce the sequence: this does not reproduce the VIP's random
+sequence or derive entropy from hardware timing. VF is unchanged unless it
+is the destination register.
+
+Unsupported instructions enter a trap, including unrecognized E/F low bytes.
+Extended instruction sets, including the `00FF` instruction used at entry by
+Destroy the Line, remain unsupported. Initial MiSTer testing has demonstrated
+some playable games, but broad game compatibility is not yet established.
+
+CHIP-8 keys `0–9` map to keypad A `0–9` (EF3), and `A–F` map to keypad B
+`1–6` (EF4). One shared scanner selects the physical digit through `OUT 2`;
+it never selects the unconnected digits `10–15`. The skip opcodes use only
+the low nibble of `Vx` and skip exactly one two-byte instruction.
+
+`Fx0A` accepts an already-held key without waiting for release or a new edge.
+It repeatedly scans virtual keys `0` through `F` in ascending order and stores
+the first detected key in `Vx`. Stable simultaneous keys therefore select the
+lowest virtual key. With no key, execution waits while interrupts, display DMA,
+and timers continue. This is an explicit input policy, not a claim of original
+COSMAC VIP wait-for-key equivalence.
 
 ## MiSTer-native memory model
 
@@ -96,14 +119,36 @@ The focused Python execution checks cover firmware bounds, boot/basic
 execution, call/return, register skips, VIP-style arithmetic, timer
 instructions, font/BCD/register memory operations, contiguous program fetch
 across a physical page boundary, screen clearing, aligned and unaligned sprite
-drawing, collision reporting, and horizontal/vertical edge wrapping. They use
+drawing, collision reporting, and horizontal/vertical edge wrapping. Input
+checks model `OUT 2` and EF3/EF4, cover all 16 keys, nibble masking, both skip
+outcomes and exact skip distance, held/later presses, blocked waits, destination
+registers including VF, and every unsupported E/F low byte. Offset-jump checks
+cover V0 selection, page carries and 12-bit wrapping. Random checks cover all
+destination registers, masks, register preservation and the full 65,535-state
+period, including zero output. They use
 small programs written for this project without original RCA or Marcel
 interpreter bytes.
 
 These checks do not validate CDP1861 interrupt/DMA timing, 60 Hz timer cadence,
-audio timing, keypad behavior, real game compatibility, FPGA RAM inference, or
+audio timing, physical keypad behavior, real game compatibility, FPGA RAM inference, or
 physical hardware behavior. No new Quartus or hardware validation is claimed
 for this revision.
+
+The input revision was also checked with the existing MiSTer Verilator harness
+using `--ce4`: DXYN smoke frames 18–23 matched a fresh `77f7cb0` baseline run
+pixel-for-pixel. A smoke variant waiting in `F70A` retained the same consecutive
+frames while its delay timer advanced, then stored `F` in V7 after B6 was pressed
+at frame 20. The IDL-synchronized ISR is unchanged. Final acceptance still
+requires MiSTer hardware input and consecutive-frame checks.
+
+After adding `Cxkk` and `Bnnn`, the same bounded 246-game diagnostic sweep
+dropped from 149 observed traps to 19. The other 227 runs exhausted their
+instruction budget without trapping; this is not a gameplay compatibility
+score. Astro Dodge, Deep8 and Deflection also reached frame 600 in `--ce4`
+simulation without remaining in the firmware trap. Six consecutive DXYN smoke
+frames matched the pre-change baseline pixel-for-pixel. These new instructions
+still need MiSTer hardware testing; Destroy the Line still requires unsupported
+instructions beginning with `00FF`.
 
 ## License
 
