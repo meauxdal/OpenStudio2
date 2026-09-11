@@ -285,6 +285,27 @@ def test_register_skips() -> None:
 
 
 
+def test_register_equality_ignores_low_nibble() -> None:
+    for nibble in range(16):
+        for right in (0x15, 0x02):
+            cpu = chip8_cpu({
+                0x0200: [
+                    0x67, 0x02,
+                    0x6A, right,
+                    0x6F, 0xA5,
+                    0x57, 0xA0 | nibble,
+                    0x61, 0x01,
+                    0x62, 0x01,
+                    0x12, 0x0C,
+                ],
+            })
+            run_until(cpu, lambda s: s.memory[0x08A2] == 1)
+            assert cpu.memory[0x08A1] == int(right != 0x02)
+            assert cpu.memory[0x08A7] == 0x02
+            assert cpu.memory[0x08AA] == right
+            assert cpu.memory[0x08AF] == 0xA5
+
+
 def test_alu_group_vip_semantics() -> None:
     cpu = chip8_cpu({
         0x0200: [
@@ -617,6 +638,7 @@ if __name__ == "__main__":
     test_boot_and_basic_chip8_execution()
     test_call_and_return()
     test_register_skips()
+    test_register_equality_ignores_low_nibble()
     test_alu_group_vip_semantics()
     test_timer_instructions()
     test_font_and_i_memory_operations()

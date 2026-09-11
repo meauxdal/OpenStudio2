@@ -399,11 +399,9 @@ op_skip_ne_imm:
         lbnz skip_next
         lbr interpreter
 
-; 5XY0 / 9XY0 ---------------------------------------------------------------
+; 5XYN / 9XY0 ---------------------------------------------------------------
+; The original VIP's 5XYN comparison ignores the low nibble.
 op_skip_eq_reg:
-        glo re
-        ani $0F
-        lbnz unsupported
         glo rf
         ani $0F
         ori VREG_LOW

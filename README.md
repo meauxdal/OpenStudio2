@@ -18,7 +18,7 @@ Implemented instructions:
 
 - `00E0`, `00EE`
 - `1nnn`, `2nnn`, `Bnnn`
-- `3xkk`, `4xkk`, `5xy0`, `9xy0`
+- `3xkk`, `4xkk`, `5xyn`, `9xy0`
 - `6xkk`, `7xkk`
 - `8xy0` through `8xy7`, `8xyE`
 - `Annn`
@@ -30,6 +30,7 @@ Implemented instructions:
 
 Implementation details:
 
+- `5xyn` ignores the low nibble, matching the original VIP (including Dot-Dash's `57AD`)
 - `8xy6` and `8xyE` shift `Vy` into `Vx`
 - logic operations leave `VF` unchanged
 - `Fx55`/`Fx65` advance `I` by `x + 1`
