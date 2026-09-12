@@ -1119,7 +1119,8 @@ key_skip_setup:
         plo rd
         lbr key_scan
 
-; Level-sensitive wait: scan virtual 0-F repeatedly, accepting held keys.
+; FX0A waits for a key press, then waits for that same key to be released
+; before returning it in VX, matching original COSMAC VIP behavior.
 ; R6 retains VX, RD.0 retains the candidate; the ISR preserves both.
 op_wait_key:
         glo rf
@@ -1162,7 +1163,7 @@ key_unpressed:
 key_pressed:
         glo re
         xri $0A
-        lbz key_wait_done
+        lbz key_wait_release
         glo re
         xri $9E
         lbz skip_next
@@ -1173,6 +1174,32 @@ key_wait_next:
         ani $0F
         plo rd
         lbr key_scan
+; FX0A has found a key in RD.0. Keep selecting that same physical key until
+; it is released. OUT 2 advances R7, so rebuild the selector pointer each pass.
+key_wait_release:
+        ldi KEY_SELECT_LOW
+        plo r7
+        glo rd
+        smi 10
+        lbnf key_wait_release_a
+
+; CHIP-8 A-F -> Studio keypad B1-B6.
+        adi 1
+        str r7
+        sex r7
+        out 2
+        bn4 key_wait_done
+        lbr key_wait_release
+
+; CHIP-8 0-9 -> Studio keypad A0-A9.
+key_wait_release_a:
+        glo rd
+        str r7
+        sex r7
+        out 2
+        bn3 key_wait_done
+        lbr key_wait_release
+
 key_wait_done:
         glo rd
         str r6
