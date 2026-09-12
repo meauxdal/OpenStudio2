@@ -610,17 +610,32 @@ def test_wait_key() -> None:
                         assert cpu.memory[0x08A0 + register] == 0xEE
                     assert set(cpu.key_selections) == set(range(10))
                     pad.add(digit)
+
+                # FX0A must latch the selected key and wait for that same key
+                # to be released before storing it in VX and returning.
+                run_until(cpu, lambda c: c.r[c.p] == symbols['key_wait_release'])
+                for _ in range(100):
+                    cpu.step()
+                    assert cpu.r[5] == 0x1204
+                    assert cpu.memory[0x08A0 + register] == 0xEE
+                pad.remove(digit)
+
                 run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
                 assert cpu.memory[0x08A0 + register] == key
                 assert cpu.r[5] == 0x1204
                 assert all(0 <= d < 10 for d in cpu.key_selections)
                 assert cpu.r[2] == 0x08FF
-    # Held simultaneous keys resolve in ascending virtual order.
+
+    # Held simultaneous keys resolve in ascending virtual order. Once FX0A
+    # chooses one key, other held keys do not satisfy its release wait.
     cpu = chip8_cpu({0x200: [0xF2, 0x0A, 0x12, 0x02]})
     cpu.keypad_a.update((9, 0))
     cpu.keypad_b.add(1)
-    run_until(cpu, lambda c: c.r[c.p] == symbols['key_wait_done'])
+    run_until(cpu, lambda c: c.r[c.p] == symbols['key_wait_release'])
     assert cpu.r[13] & 15 == 0
+    cpu.keypad_a.remove(0)
+    run_until(cpu, lambda c: c.r[c.p] == symbols['interpreter'])
+    assert cpu.memory[0x08A2] == 0
 
 
 def test_unsupported_key_variants() -> None:
