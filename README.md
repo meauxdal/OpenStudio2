@@ -1,6 +1,6 @@
 # OpenStudio2
 
-OpenStudio2 is a CHIP-8 interpreter/firmware for the MiSTer FPGA RCA Studio II core. It is not intended to run on original Studio II hardware.
+OpenStudio2 is a bare-metal firmware and CHIP-8 interpreter for the MiSTer FPGA RCA Studio II core. It removes the split-memory translation and restricted writable-memory scheme required to fit CHIP-8 into the Studio II’s 512-byte RAM architecture. It cannot (and is not intended to) run on original Studio II hardware.
 
 ## Implementation
 
@@ -12,7 +12,7 @@ OpenStudio2 is a CHIP-8 interpreter/firmware for the MiSTer FPGA RCA Studio II c
 - keypad input
 - sprite drawing and collision detection
 - pseudorandom number generation
-- direct access to the core's 4 KiB CHIP-8 RAM
+- dedicated 4 KiB CHIP-8 RAM
 
 Implemented instructions:
 
@@ -30,7 +30,7 @@ Implemented instructions:
 
 Implementation details:
 
-- `5xyn` ignores the low nibble, matching the original VIP (including Dot-Dash's `57AD`)
+- `5xyn` ignores the low nibble
 - `8xy6` and `8xyE` shift `Vy` into `Vx`
 - logic operations leave `VF` unchanged
 - `Fx55`/`Fx65` advance `I` by `x + 1`
